@@ -239,6 +239,12 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
                         "fps": feat_vis_fps,
                     }
                 )
+            # Add Point Cloud PLY export parameters
+            if "point_cloud_ply" in export_format:
+                if "point_cloud_ply" not in export_kwargs:
+                    export_kwargs["point_cloud_ply"] = {}
+                # Set default parameters if not provided
+                export_kwargs["point_cloud_ply"].setdefault("conf_thresh_percentile", conf_thresh_percentile)
             self._export_results(prediction, export_format, export_dir, **export_kwargs)
 
         return prediction

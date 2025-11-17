@@ -34,6 +34,7 @@ from depth_anything_3.services.input_handlers import (
     parse_export_feat,
 )
 from depth_anything_3.utils.constants import DEFAULT_EXPORT_DIR, DEFAULT_GALLERY_DIR, DEFAULT_GRADIO_DIR, DEFAULT_MODEL
+from depth_anything_3.utils.export.point_cloud import load_camera_params
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -568,6 +569,142 @@ def video(
         show_cameras=show_cameras,
         feat_vis_fps=feat_vis_fps,
     )
+
+
+@app.command()
+def video_pointcloud(
+    video_path: str = typer.Argument(..., help="Path to input video file"),
+    camera_params: str = typer.Option(
+        None, help="Path to JSON file containing camera intrinsic parameters"
+    ),
+    fps: float = typer.Option(1.0, help="Sampling FPS for frame extraction"),
+    model_dir: str = typer.Option(DEFAULT_MODEL, help="Model directory path"),
+    export_dir: str = typer.Option(DEFAULT_EXPORT_DIR, help="Export directory"),
+    device: str = typer.Option("cuda", help="Device to use"),
+    process_res: int = typer.Option(504, help="Processing resolution"),
+    process_res_method: str = typer.Option(
+        "upper_bound_resize", help="Processing resolution method"
+    ),
+    auto_cleanup: bool = typer.Option(
+        False, help="Automatically clean export directory if it exists (no prompt)"
+    ),
+    # Point cloud specific options
+    voxel_size: float = typer.Option(
+        0.01, help="[PC] Voxel size for point cloud downsampling (0 for no downsampling)"
+    ),
+    conf_thresh: float = typer.Option(1.0, help="[PC] Base confidence threshold"),
+    conf_thresh_percentile: float = typer.Option(
+        40.0, help="[PC] Lower percentile for adaptive confidence threshold"
+    ),
+    depth_scale: float = typer.Option(1.0, help="[PC] Scale factor for depth values"),
+    max_depth: float = typer.Option(100.0, help="[PC] Maximum depth value to consider"),
+    use_icp: bool = typer.Option(
+        False, help="[PC] Use ICP for frame-to-frame alignment (when no poses available)"
+    ),
+    icp_voxel_size: float = typer.Option(0.05, help="[PC] Voxel size for ICP alignment"),
+    remove_outliers: bool = typer.Option(True, help="[PC] Remove statistical outliers"),
+    nb_neighbors: int = typer.Option(20, help="[PC] Number of neighbors for outlier removal"),
+    std_ratio: float = typer.Option(2.0, help="[PC] Standard deviation ratio for outlier removal"),
+    export_per_frame: bool = typer.Option(
+        False, help="[PC] Export individual frame point clouds"
+    ),
+    also_export_glb: bool = typer.Option(
+        False, help="Also export GLB format alongside point cloud PLY"
+    ),
+):
+    """
+    Generate dense point cloud map from video with known camera parameters.
+
+    This command is optimized for RGB-D sensor data (e.g., Femto Bolt) where
+    camera intrinsic parameters are known. It produces high-quality point cloud
+    maps that surpass traditional SfM methods.
+
+    Camera parameters JSON format:
+    {
+        "fx": 600.0,        # focal length x
+        "fy": 600.0,        # focal length y
+        "cx": 320.0,        # principal point x
+        "cy": 240.0,        # principal point y
+        "width": 640,       # original image width (optional)
+        "height": 480,      # original image height (optional)
+        "depth_scale": 1.0  # depth scale factor (optional)
+    }
+    """
+    from depth_anything_3.api import DepthAnything3
+
+    typer.echo(f"Processing video for point cloud generation: {video_path}")
+    typer.echo(f"FPS: {fps}")
+
+    # Handle export directory
+    export_dir = InputHandler.handle_export_dir(export_dir, auto_cleanup)
+
+    # Process input video
+    image_files = VideoHandler.process(video_path, export_dir, fps)
+    typer.echo(f"Extracted {len(image_files)} frames")
+
+    # Load camera parameters if provided
+    cam_params = None
+    if camera_params:
+        try:
+            cam_params = load_camera_params(camera_params)
+            typer.echo(f"Loaded camera parameters from: {camera_params}")
+            typer.echo(f"  fx={cam_params['fx']}, fy={cam_params['fy']}")
+            typer.echo(f"  cx={cam_params['cx']}, cy={cam_params['cy']}")
+            if "width" in cam_params:
+                typer.echo(f"  Original resolution: {cam_params['width']}x{cam_params['height']}")
+        except Exception as e:
+            typer.echo(f"Warning: Failed to load camera parameters: {e}")
+            typer.echo("Proceeding with default/estimated intrinsics")
+
+    # Load model
+    typer.echo(f"Loading model from {model_dir}...")
+    model = DepthAnything3.from_pretrained(model_dir).to(device)
+
+    # Prepare export kwargs for point cloud
+    export_kwargs = {
+        "point_cloud_ply": {
+            "camera_params": cam_params,
+            "voxel_size": voxel_size,
+            "conf_thresh": conf_thresh,
+            "conf_thresh_percentile": conf_thresh_percentile,
+            "depth_scale": depth_scale,
+            "max_depth": max_depth,
+            "use_icp_alignment": use_icp,
+            "icp_voxel_size": icp_voxel_size,
+            "remove_outliers": remove_outliers,
+            "nb_neighbors": nb_neighbors,
+            "std_ratio": std_ratio,
+            "export_per_frame": export_per_frame,
+        }
+    }
+
+    # Determine export format
+    export_format = "point_cloud_ply"
+    if also_export_glb:
+        export_format = "point_cloud_ply-glb"
+
+    # Run inference
+    typer.echo(f"Running inference on {len(image_files)} frames...")
+    prediction = model.inference(
+        image=image_files,
+        process_res=process_res,
+        process_res_method=process_res_method,
+        export_dir=export_dir,
+        export_format=export_format,
+        conf_thresh_percentile=conf_thresh_percentile,
+        export_kwargs=export_kwargs,
+    )
+
+    typer.echo(f"Point cloud map exported to: {export_dir}")
+    typer.echo("Generated files:")
+    typer.echo(f"  - point_cloud_map.ply (main point cloud)")
+    typer.echo(f"  - point_cloud_metadata.json (metadata)")
+    if export_per_frame:
+        typer.echo(f"  - frame_XXXX.ply (individual frame point clouds)")
+    if also_export_glb:
+        typer.echo(f"  - scene.glb (interactive 3D scene)")
+
+    typer.echo("\nPoint cloud generation completed successfully!")
 
 
 # ============================================================================

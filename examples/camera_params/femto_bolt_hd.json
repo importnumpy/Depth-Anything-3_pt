@@ -1,0 +1,10 @@
+{
+    "fx": 910.0,
+    "fy": 910.0,
+    "cx": 640.0,
+    "cy": 360.0,
+    "width": 1280,
+    "height": 720,
+    "depth_scale": 1.0,
+    "_comment": "Femto Bolt RGB camera HD mode intrinsics (default values, adjust based on your calibration)"
+}
