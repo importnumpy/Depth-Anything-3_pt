@@ -35,6 +35,7 @@ from depth_anything_3.services.input_handlers import (
 )
 from depth_anything_3.utils.constants import DEFAULT_EXPORT_DIR, DEFAULT_GALLERY_DIR, DEFAULT_GRADIO_DIR, DEFAULT_MODEL
 from depth_anything_3.utils.export.point_cloud import load_camera_params
+from depth_anything_3.utils.export.point_cloud_batched import export_to_point_cloud_ply_batched, clear_memory
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -588,9 +589,19 @@ def video_pointcloud(
     auto_cleanup: bool = typer.Option(
         False, help="Automatically clean export directory if it exists (no prompt)"
     ),
+    # Memory optimization options
+    batch_size: int = typer.Option(
+        20, help="[MEMORY] Number of frames to process at once (reduce if OOM occurs)"
+    ),
+    merge_stride: int = typer.Option(
+        5, help="[MEMORY] Merge accumulated point clouds every N batches"
+    ),
     # Point cloud specific options
     voxel_size: float = typer.Option(
-        0.01, help="[PC] Voxel size for point cloud downsampling (0 for no downsampling)"
+        0.01, help="[PC] Voxel size for intermediate point cloud downsampling"
+    ),
+    final_voxel_size: float = typer.Option(
+        None, help="[PC] Final voxel size (if None, uses voxel_size)"
     ),
     conf_thresh: float = typer.Option(1.0, help="[PC] Base confidence threshold"),
     conf_thresh_percentile: float = typer.Option(
@@ -613,11 +624,16 @@ def video_pointcloud(
     ),
 ):
     """
-    Generate dense point cloud map from video with known camera parameters.
+    Generate dense point cloud map from long videos (5000-10000+ frames) with minimal memory.
 
-    This command is optimized for RGB-D sensor data (e.g., Femto Bolt) where
-    camera intrinsic parameters are known. It produces high-quality point cloud
-    maps that surpass traditional SfM methods.
+    This command uses memory-efficient batched processing optimized for very long videos.
+    Inspired by VGGT-Long for efficient long-sequence processing.
+
+    Memory Tips:
+    - Reduce --batch-size if you encounter OOM errors (try 10 or 5)
+    - Increase --voxel-size for intermediate downsampling
+    - Use --final-voxel-size for aggressive final downsampling
+    - Disable --export-per-frame to save memory
 
     Camera parameters JSON format:
     {
@@ -629,82 +645,143 @@ def video_pointcloud(
         "height": 480,      # original image height (optional)
         "depth_scale": 1.0  # depth scale factor (optional)
     }
+
+    Example for very long video (5000+ frames):
+    da3 video-pointcloud long_video.mp4 \\
+        --camera-params params.json \\
+        --fps 2.0 \\
+        --batch-size 15 \\
+        --voxel-size 0.015 \\
+        --final-voxel-size 0.01 \\
+        --merge-stride 3
     """
     from depth_anything_3.api import DepthAnything3
 
-    typer.echo(f"Processing video for point cloud generation: {video_path}")
-    typer.echo(f"FPS: {fps}")
+    typer.echo("=" * 70)
+    typer.echo("MEMORY-EFFICIENT POINT CLOUD GENERATION FOR LONG VIDEOS")
+    typer.echo("=" * 70)
+    typer.echo(f"Video: {video_path}")
+    typer.echo(f"Sampling FPS: {fps}")
+    typer.echo(f"Batch size: {batch_size} frames/batch")
+    typer.echo(f"Merge stride: {merge_stride} batches")
 
     # Handle export directory
     export_dir = InputHandler.handle_export_dir(export_dir, auto_cleanup)
 
     # Process input video
+    typer.echo("\nExtracting frames from video...")
     image_files = VideoHandler.process(video_path, export_dir, fps)
-    typer.echo(f"Extracted {len(image_files)} frames")
+    num_frames = len(image_files)
+    typer.echo(f"Extracted {num_frames} frames")
+
+    # Provide memory estimate
+    estimated_batches = (num_frames + batch_size - 1) // batch_size
+    typer.echo(f"\nProcessing plan:")
+    typer.echo(f"  - Total frames: {num_frames}")
+    typer.echo(f"  - Estimated batches: {estimated_batches}")
+    typer.echo(f"  - Progressive merges: ~{estimated_batches // merge_stride}")
+
+    if num_frames > 100:
+        typer.echo(f"\n⚠️  Large video detected ({num_frames} frames)")
+        typer.echo("   Using batched processing to prevent OOM")
+        if batch_size > 20:
+            typer.echo(f"   Consider reducing --batch-size to {min(15, batch_size)}")
 
     # Load camera parameters if provided
     cam_params = None
     if camera_params:
         try:
             cam_params = load_camera_params(camera_params)
-            typer.echo(f"Loaded camera parameters from: {camera_params}")
-            typer.echo(f"  fx={cam_params['fx']}, fy={cam_params['fy']}")
-            typer.echo(f"  cx={cam_params['cx']}, cy={cam_params['cy']}")
+            typer.echo(f"\nCamera parameters loaded:")
+            typer.echo(f"  fx={cam_params['fx']:.2f}, fy={cam_params['fy']:.2f}")
+            typer.echo(f"  cx={cam_params['cx']:.2f}, cy={cam_params['cy']:.2f}")
             if "width" in cam_params:
                 typer.echo(f"  Original resolution: {cam_params['width']}x{cam_params['height']}")
         except Exception as e:
-            typer.echo(f"Warning: Failed to load camera parameters: {e}")
-            typer.echo("Proceeding with default/estimated intrinsics")
+            typer.echo(f"\n⚠️  Warning: Failed to load camera parameters: {e}")
+            typer.echo("   Proceeding with default/estimated intrinsics")
 
     # Load model
-    typer.echo(f"Loading model from {model_dir}...")
+    typer.echo(f"\nLoading model from {model_dir}...")
     model = DepthAnything3.from_pretrained(model_dir).to(device)
+    typer.echo("Model loaded successfully")
 
-    # Prepare export kwargs for point cloud
-    export_kwargs = {
-        "point_cloud_ply": {
-            "camera_params": cam_params,
-            "voxel_size": voxel_size,
-            "conf_thresh": conf_thresh,
-            "conf_thresh_percentile": conf_thresh_percentile,
-            "depth_scale": depth_scale,
-            "max_depth": max_depth,
-            "use_icp_alignment": use_icp,
-            "icp_voxel_size": icp_voxel_size,
-            "remove_outliers": remove_outliers,
-            "nb_neighbors": nb_neighbors,
-            "std_ratio": std_ratio,
-            "export_per_frame": export_per_frame,
-        }
-    }
+    # Use batched processing
+    typer.echo(f"\n{'='*70}")
+    typer.echo("STARTING BATCHED INFERENCE")
+    typer.echo(f"{'='*70}\n")
 
-    # Determine export format
-    export_format = "point_cloud_ply"
-    if also_export_glb:
-        export_format = "point_cloud_ply-glb"
+    try:
+        out_path = export_to_point_cloud_ply_batched(
+            model=model,
+            image_paths=image_files,
+            export_dir=export_dir,
+            camera_params=cam_params,
+            batch_size=batch_size,
+            process_res=process_res,
+            process_res_method=process_res_method,
+            voxel_size=voxel_size,
+            conf_thresh=conf_thresh,
+            conf_thresh_percentile=conf_thresh_percentile,
+            depth_scale=depth_scale,
+            max_depth=max_depth,
+            use_icp_alignment=use_icp,
+            icp_voxel_size=icp_voxel_size,
+            remove_outliers=remove_outliers,
+            nb_neighbors=nb_neighbors,
+            std_ratio=std_ratio,
+            export_per_frame=export_per_frame,
+            merge_stride=merge_stride,
+            final_voxel_size=final_voxel_size,
+        )
 
-    # Run inference
-    typer.echo(f"Running inference on {len(image_files)} frames...")
-    prediction = model.inference(
-        image=image_files,
-        process_res=process_res,
-        process_res_method=process_res_method,
-        export_dir=export_dir,
-        export_format=export_format,
-        conf_thresh_percentile=conf_thresh_percentile,
-        export_kwargs=export_kwargs,
-    )
+        # Also export GLB if requested
+        if also_export_glb and out_path:
+            typer.echo("\nGenerating GLB file for visualization...")
+            try:
+                # Run a small batch inference for GLB export
+                glb_batch_size = min(50, num_frames)
+                glb_stride = max(1, num_frames // glb_batch_size)
+                glb_frames = image_files[::glb_stride][:glb_batch_size]
 
-    typer.echo(f"Point cloud map exported to: {export_dir}")
+                typer.echo(f"Using {len(glb_frames)} sampled frames for GLB generation...")
+
+                prediction = model.inference(
+                    image=glb_frames,
+                    process_res=process_res,
+                    process_res_method=process_res_method,
+                    export_dir=export_dir,
+                    export_format="glb",
+                    conf_thresh_percentile=conf_thresh_percentile,
+                )
+                del prediction
+                clear_memory()
+                typer.echo("GLB export completed")
+            except Exception as e:
+                typer.echo(f"Warning: GLB export failed: {e}")
+
+    except Exception as e:
+        typer.echo(f"\n❌ Error during point cloud generation: {e}")
+        import traceback
+        traceback.print_exc()
+        raise typer.Exit(1)
+    finally:
+        # Clean up
+        del model
+        clear_memory()
+
+    typer.echo(f"\n{'='*70}")
+    typer.echo("POINT CLOUD GENERATION COMPLETED")
+    typer.echo(f"{'='*70}")
+    typer.echo(f"\nOutput directory: {export_dir}")
     typer.echo("Generated files:")
-    typer.echo(f"  - point_cloud_map.ply (main point cloud)")
-    typer.echo(f"  - point_cloud_metadata.json (metadata)")
+    typer.echo(f"  ✓ point_cloud_map.ply (merged point cloud)")
+    typer.echo(f"  ✓ point_cloud_metadata.json (metadata)")
     if export_per_frame:
-        typer.echo(f"  - frame_XXXX.ply (individual frame point clouds)")
+        typer.echo(f"  ✓ frame_XXXX.ply (individual frames)")
     if also_export_glb:
-        typer.echo(f"  - scene.glb (interactive 3D scene)")
-
-    typer.echo("\nPoint cloud generation completed successfully!")
+        typer.echo(f"  ✓ scene.glb (interactive 3D visualization)")
+    typer.echo("\n✅ Success! Point cloud generation completed.")
 
 
 # ============================================================================
