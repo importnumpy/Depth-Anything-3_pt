@@ -1,0 +1,58 @@
+# Point Cloud Scanning Configuration
+
+# Model settings
+model:
+  model_dir: "depth-anything/Depth-Anything-V2-Large"
+  device: "cuda"
+  process_res: 504
+  batch_size: 20
+
+# Video processing
+video:
+  fps: 3.0  # Frame sampling rate
+  image_extensions: ["png", "jpg", "jpeg"]
+
+# Loop closure detection
+loop_closure:
+  enabled: true
+  method: "hybrid"  # "deep", "orb", or "hybrid"
+  visual_threshold: 0.7
+  geometric_threshold: 0.6
+  combined_threshold: 0.75
+  temporal_gap: 30  # Minimum frames between loop candidates
+
+# Pose graph optimization
+optimization:
+  use_g2o: null  # null = auto-detect, true/false = force
+  max_iterations: 50
+  odometry_sigma:
+    translation: 0.01  # meters
+    rotation: 0.01  # radians
+  loop_sigma:
+    translation: 0.005
+    rotation: 0.005
+
+# Point cloud processing
+point_cloud:
+  voxel_size: 0.005  # meters
+  conf_thresh_percentile: 40.0
+  remove_outliers: true
+  nb_neighbors: 20
+  std_ratio: 2.0
+
+# Mesh reconstruction
+mesh:
+  enabled: true
+  method: "poisson"  # "poisson" or "ball_pivoting"
+  poisson_depth: 9  # Higher = more detail
+  density_threshold: 0.01
+
+# Output settings
+output:
+  save_raw_pointcloud: true
+  save_optimized_pointcloud: true
+  save_mesh_ply: true
+  save_mesh_obj: true
+  save_loop_closures_json: true
+  save_trajectory_visualization: true
+  save_metadata: true

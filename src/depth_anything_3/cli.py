@@ -886,6 +886,297 @@ def video_pointcloud(
     typer.echo("\n✅ Success! Point cloud generation completed.")
 
 
+@app.command()
+def scan_360(
+    videos: list[str] = typer.Argument(
+        ..., help="List of MP4 video files for 360° scanning"
+    ),
+    output_dir: str = typer.Option(
+        "pointcloud_scan/output", help="Output directory for scan results"
+    ),
+    camera_params: str = typer.Option(
+        None, help="Path to JSON file containing camera intrinsic parameters"
+    ),
+    config: str = typer.Option(
+        None, help="Path to custom scan_config.yaml (optional)"
+    ),
+    # Video processing
+    fps: float = typer.Option(3.0, help="Frame sampling rate (FPS)"),
+    model_dir: str = typer.Option(DEFAULT_MODEL, help="Model directory path"),
+    device: str = typer.Option("cuda", help="Device to use"),
+    process_res: int = typer.Option(504, help="Processing resolution"),
+    batch_size: int = typer.Option(20, help="Batch size for processing"),
+    # Loop closure
+    enable_loop_closure: bool = typer.Option(
+        True, help="Enable loop closure detection and optimization"
+    ),
+    loop_method: str = typer.Option(
+        "hybrid", help="Loop closure method: 'deep', 'orb', or 'hybrid'"
+    ),
+    loop_threshold: float = typer.Option(
+        0.75, help="Loop closure detection threshold (0.65-0.85)"
+    ),
+    temporal_gap: int = typer.Option(
+        30, help="Minimum frame gap for loop closure candidates"
+    ),
+    # Optimization
+    use_g2o: bool = typer.Option(
+        None, help="Force use of g2o (auto-detect if None)"
+    ),
+    max_iterations: int = typer.Option(50, help="Maximum optimization iterations"),
+    # Point cloud processing
+    voxel_size: float = typer.Option(
+        0.005, help="Voxel size for point cloud downsampling (meters)"
+    ),
+    conf_thresh_percentile: float = typer.Option(
+        40.0, help="Confidence threshold percentile"
+    ),
+    # Mesh reconstruction
+    generate_mesh: bool = typer.Option(
+        True, help="Generate mesh from point cloud"
+    ),
+    mesh_method: str = typer.Option(
+        "poisson", help="Mesh reconstruction method: 'poisson' or 'ball_pivoting'"
+    ),
+    mesh_depth: int = typer.Option(
+        9, help="Poisson reconstruction depth (higher = more detail)"
+    ),
+    # Multi-GPU
+    use_distributed: bool = typer.Option(
+        False, help="Use distributed multi-GPU processing"
+    ),
+    num_gpus: int = typer.Option(
+        None, help="Number of GPUs to use (default: all available)"
+    ),
+):
+    """
+    360° object scanning with loop closure optimization.
+
+    This command processes multiple MP4 videos of an object (e.g., car) filmed from
+    different angles, generates a unified point cloud with loop closure optimization,
+    and optionally creates a high-quality mesh.
+
+    Features:
+    - Multi-video processing and merging
+    - Loop closure detection (visual + geometric)
+    - Pose graph optimization for drift correction
+    - High-quality mesh reconstruction
+    - Cross-platform (Ubuntu & Windows)
+    - GPU-accelerated processing
+
+    Camera parameters JSON format:
+    {
+        "fx": 591.0,        # focal length x
+        "fy": 591.0,        # focal length y
+        "cx": 320.0,        # principal point x
+        "cy": 240.0,        # principal point y
+        "width": 640,       # image width (optional)
+        "height": 480,      # image height (optional)
+        "depth_scale": 1.0  # depth scale factor (optional)
+    }
+
+    Example - Car scanning with multiple videos:
+    da3 scan-360 front.mp4 side.mp4 back.mp4 \\
+        --output-dir output/my_car \\
+        --camera-params femto_bolt.json \\
+        --fps 3.0 \\
+        --loop-threshold 0.8 \\
+        --generate-mesh
+
+    Example - Disable loop closure for simple scans:
+    da3 scan-360 simple.mp4 \\
+        --output-dir output/simple \\
+        --camera-params params.json \\
+        --no-enable-loop-closure
+
+    Example - High-detail mesh:
+    da3 scan-360 *.mp4 \\
+        --output-dir output/high_detail \\
+        --camera-params params.json \\
+        --voxel-size 0.003 \\
+        --mesh-depth 10
+    """
+    import yaml
+    from pathlib import Path
+
+    typer.echo("=" * 70)
+    typer.echo("360° OBJECT SCANNING WITH LOOP CLOSURE")
+    typer.echo("=" * 70)
+
+    # Validate video files
+    video_paths = []
+    for video in videos:
+        if not os.path.exists(video):
+            typer.echo(f"❌ Error: Video file not found: {video}", err=True)
+            raise typer.Exit(1)
+        video_paths.append(os.path.abspath(video))
+
+    typer.echo(f"\nInput videos: {len(video_paths)}")
+    for i, vp in enumerate(video_paths, 1):
+        typer.echo(f"  {i}. {os.path.basename(vp)}")
+
+    # Load configuration
+    default_config_path = Path(__file__).parent.parent.parent / "pointcloud_scan" / "config" / "scan_config.yaml"
+
+    if config and os.path.exists(config):
+        config_path = config
+        typer.echo(f"\nUsing custom config: {config}")
+    elif default_config_path.exists():
+        config_path = str(default_config_path)
+        typer.echo(f"\nUsing default config: {config_path}")
+    else:
+        config_path = None
+        typer.echo("\n⚠️  Warning: No config file found, using command-line parameters")
+
+    scan_config = {}
+    if config_path:
+        try:
+            with open(config_path, 'r') as f:
+                scan_config = yaml.safe_load(f)
+        except Exception as e:
+            typer.echo(f"⚠️  Warning: Failed to load config: {e}")
+
+    # Load camera parameters
+    cam_params = None
+    if camera_params:
+        if not os.path.exists(camera_params):
+            typer.echo(f"❌ Error: Camera parameters file not found: {camera_params}", err=True)
+            raise typer.Exit(1)
+        try:
+            cam_params = load_camera_params(camera_params)
+            typer.echo(f"\nCamera parameters loaded:")
+            typer.echo(f"  fx={cam_params['fx']:.2f}, fy={cam_params['fy']:.2f}")
+            typer.echo(f"  cx={cam_params['cx']:.2f}, cy={cam_params['cy']:.2f}")
+        except Exception as e:
+            typer.echo(f"❌ Error loading camera parameters: {e}", err=True)
+            raise typer.Exit(1)
+    else:
+        typer.echo("\n⚠️  Warning: No camera parameters provided")
+        typer.echo("   Using model-estimated intrinsics (may be less accurate)")
+
+    # Processing parameters
+    typer.echo(f"\nProcessing parameters:")
+    typer.echo(f"  FPS: {fps}")
+    typer.echo(f"  Batch size: {batch_size}")
+    typer.echo(f"  Voxel size: {voxel_size}m")
+    if enable_loop_closure:
+        typer.echo(f"\nLoop closure:")
+        typer.echo(f"  Method: {loop_method}")
+        typer.echo(f"  Threshold: {loop_threshold}")
+        typer.echo(f"  Temporal gap: {temporal_gap} frames")
+        typer.echo(f"  Optimization: {'g2o (forced)' if use_g2o else 'auto-detect'}")
+    else:
+        typer.echo(f"\nLoop closure: DISABLED")
+
+    if generate_mesh:
+        typer.echo(f"\nMesh reconstruction:")
+        typer.echo(f"  Method: {mesh_method}")
+        typer.echo(f"  Depth: {mesh_depth}")
+
+    # Check multi-GPU
+    import torch
+    available_gpus = torch.cuda.device_count()
+    if use_distributed:
+        if available_gpus < 2:
+            typer.echo("\n⚠️  Warning: Distributed mode requires multiple GPUs")
+            typer.echo(f"   Found {available_gpus} GPU(s). Falling back to single-GPU mode.")
+            use_distributed = False
+        else:
+            if num_gpus is None:
+                num_gpus = available_gpus
+            else:
+                num_gpus = min(num_gpus, available_gpus)
+            typer.echo(f"\nMulti-GPU: Using {num_gpus} GPUs")
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    typer.echo(f"\nOutput directory: {output_dir}")
+
+    # Initialize processor
+    typer.echo(f"\n{'='*70}")
+    typer.echo("INITIALIZING PROCESSOR")
+    typer.echo(f"{'='*70}\n")
+
+    try:
+        from pointcloud_scan.src.multi_video_processor import MultiVideoPointCloudProcessor
+
+        processor = MultiVideoPointCloudProcessor(
+            model_dir=model_dir,
+            device=device,
+            config=scan_config,
+        )
+
+        typer.echo("Processor initialized successfully\n")
+
+        # Process videos
+        typer.echo(f"{'='*70}")
+        typer.echo("STARTING PROCESSING")
+        typer.echo(f"{'='*70}\n")
+
+        results = processor.process_videos(
+            video_paths=video_paths,
+            output_dir=output_dir,
+            camera_params=cam_params,
+            fps=fps,
+            batch_size=batch_size,
+            process_res=process_res,
+            voxel_size=voxel_size,
+            conf_thresh_percentile=conf_thresh_percentile,
+            enable_loop_closure=enable_loop_closure,
+            loop_method=loop_method,
+            loop_threshold=loop_threshold,
+            temporal_gap=temporal_gap,
+            use_g2o=use_g2o,
+            max_iterations=max_iterations,
+            generate_mesh=generate_mesh,
+            mesh_method=mesh_method,
+            mesh_depth=mesh_depth,
+            use_distributed=use_distributed,
+            num_gpus=num_gpus,
+        )
+
+        # Display results
+        typer.echo(f"\n{'='*70}")
+        typer.echo("PROCESSING COMPLETED")
+        typer.echo(f"{'='*70}\n")
+
+        typer.echo("Processing summary:")
+        typer.echo(f"  Total frames: {results['num_frames']}")
+        typer.echo(f"  Processing time: {results['processing_time']:.1f}s")
+
+        if enable_loop_closure and 'num_loop_closures' in results:
+            typer.echo(f"  Loop closures detected: {results['num_loop_closures']}")
+
+        if 'num_points_raw' in results:
+            typer.echo(f"  Points (raw): {results['num_points_raw']:,}")
+        if 'num_points_optimized' in results:
+            typer.echo(f"  Points (optimized): {results['num_points_optimized']:,}")
+
+        if generate_mesh and 'mesh_vertices' in results:
+            typer.echo(f"  Mesh vertices: {results['mesh_vertices']:,}")
+            typer.echo(f"  Mesh triangles: {results['mesh_triangles']:,}")
+
+        typer.echo(f"\nOutput files:")
+        if 'output_files' in results:
+            for file_type, file_path in results['output_files'].items():
+                if file_path and os.path.exists(file_path):
+                    typer.echo(f"  ✓ {file_type}: {os.path.basename(file_path)}")
+
+        typer.echo(f"\n✅ Success! 360° scan completed.")
+        typer.echo(f"   Results saved to: {output_dir}")
+
+    except ImportError as e:
+        typer.echo(f"\n❌ Error: Failed to import required modules", err=True)
+        typer.echo(f"   {e}", err=True)
+        typer.echo(f"\n   Make sure the pointcloud_scan package is properly installed.", err=True)
+        raise typer.Exit(1)
+    except Exception as e:
+        typer.echo(f"\n❌ Error during processing: {e}", err=True)
+        import traceback
+        traceback.print_exc()
+        raise typer.Exit(1)
+
+
 # ============================================================================
 # Service management commands
 # ============================================================================
